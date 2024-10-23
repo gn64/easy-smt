@@ -865,6 +865,101 @@ impl Context {
     binop!(bvsgt, bvsgt);
 }
 
+impl Context {
+    /// Solves the SMT problem with given assumptions and returns the result with model if SAT.
+    ///
+    /// This is a convenience wrapper that:
+    /// 1. Pushes a new context frame
+    /// 2. Asserts all provided assumptions
+    /// 3. Checks satisfiability
+    /// 4. Gets the model if SAT
+    /// 5. Pops the context frame
+    ///
+    /// # Arguments
+    /// * `assumptions` - Iterator of expressions to be temporarily assumed true
+    ///
+    /// # Returns
+    /// * `io::Result<Option<(Response, SExpr)>>` - On success:
+    ///   * `Some((Response::Sat, model))` if satisfiable with the model
+    ///   * `Some((Response::Unsat, _))` if unsatisfiable
+    ///   * `Some((Response::Unknown, _))` if unknown
+    ///   * `None` if no solver is configured
+    ///
+    /// # Example
+    /// ```
+    /// # use your_crate::*;
+    /// let mut ctx = ContextBuilder::new()
+    ///     .solver("z3", &["-in"])
+    ///     .build()?;
+    ///
+    /// let x = ctx.declare_const("x", ctx.bool_sort())?;
+    /// let result = ctx.solve_with_assumption([x])?;
+    /// ```
+    pub fn solve_with_assumption<I>(
+        &mut self,
+        assumptions: I,
+    ) -> io::Result<Option<(Response, SExpr)>>
+    where
+        I: IntoIterator<Item = SExpr>,
+    {
+        // Early return if no solver configured
+        let solver = match &mut self.solver {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Push a new context frame
+        solver.ack_command(
+            &self.arena,
+            self.atoms.success,
+            self.arena.list(vec![self.atoms.push]),
+        )?;
+
+        // Assert all assumptions
+        for assumption in assumptions {
+            solver.ack_command(
+                &self.arena,
+                self.atoms.success,
+                self.arena.list(vec![self.atoms.assert, assumption]),
+            )?;
+        }
+
+        // Check satisfiability
+        solver.send(&self.arena, self.arena.list(vec![self.atoms.check_sat]))?;
+        let resp = solver.recv(&self.arena)?;
+        let response = if resp == self.atoms.sat {
+            Response::Sat
+        } else if resp == self.atoms.unsat {
+            Response::Unsat
+        } else if resp == self.atoms.unknown {
+            Response::Unknown
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Unexpected result from solver: {}", self.display(resp)),
+            ));
+        };
+
+        // Get model if satisfiable
+        let model = if response == Response::Sat {
+            solver.send(&self.arena, self.arena.list(vec![self.atoms.get_model]))?;
+            solver.recv(&self.arena)?
+        } else {
+            // Dummy value for unsat/unknown cases
+            self.arena.list(vec![])
+        };
+
+        // Pop the context frame
+        solver.ack_command(
+            &self.arena,
+            self.atoms.success,
+            self.arena.list(vec![self.atoms.pop]),
+        )?;
+
+        Ok(Some((response, model)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Response {
     Sat,
@@ -978,5 +1073,123 @@ mod tests {
 
         // This should trigger a panic in debug builds.
         let _ = ctx2.get(pizza1);
+    }
+    #[test]
+    fn test_solve_with_assumption() -> io::Result<()> {
+        let mut ctx = ContextBuilder::new().solver("z3", &["-in"]).build()?;
+
+        // Declare boolean variable x
+        let x = ctx.declare_const("x", ctx.bool_sort())?;
+
+        // Solve with x assumed true
+        if let Some((response, model)) = ctx.solve_with_assumption([x])? {
+            assert_eq!(response, Response::Sat);
+            // モデルの内容を確認
+            match ctx.get(model) {
+                SExprData::List(elements) => {
+                    assert!(!elements.is_empty(), "Model should not be empty");
+                }
+                _ => panic!("Expected model to be a list"),
+            }
+        } else {
+            panic!("Expected solver to be configured");
+        }
+
+        // Solve with x and not x (should be unsat)
+        if let Some((response, _)) = ctx.solve_with_assumption([x, ctx.not(x)])? {
+            assert_eq!(response, Response::Unsat);
+        } else {
+            panic!("Expected solver to be configured");
+        }
+
+        Ok(())
+    }
+    #[test]
+    fn test_solve_with_assumption_comprehensive() -> io::Result<()> {
+        let mut ctx = ContextBuilder::new().solver("z3", &["-in"]).build()?;
+
+        // 基本的なケース: 単一の変数
+        let x = ctx.declare_const("x", ctx.bool_sort())?;
+
+        // 単一の変数が真の場合
+        if let Some((response, model)) = ctx.solve_with_assumption([x])? {
+            assert_eq!(response, Response::Sat);
+            match ctx.get(model) {
+                SExprData::List(elements) => {
+                    assert!(
+                        !elements.is_empty(),
+                        "Model should not be empty for SAT result"
+                    );
+                }
+                _ => panic!("Expected model to be a list"),
+            }
+        } else {
+            panic!("Expected solver to be configured");
+        }
+
+        // 矛盾する仮定のケース
+        if let Some((response, model)) = ctx.solve_with_assumption([x, ctx.not(x)])? {
+            assert_eq!(response, Response::Unsat);
+            match ctx.get(model) {
+                SExprData::List(elements) => {
+                    assert!(
+                        elements.is_empty(),
+                        "Model should be empty for UNSAT result"
+                    );
+                }
+                _ => panic!("Expected model to be a list"),
+            }
+        }
+
+        // 複数の変数のテスト
+        let y = ctx.declare_const("y", ctx.bool_sort())?;
+        let z = ctx.declare_const("z", ctx.bool_sort())?;
+
+        // x AND y -> z という制約を追加
+        ctx.assert(ctx.imp(ctx.and(x, y), z))?;
+
+        // x, y が真で z が偽の場合（充足不可能なはず）
+        if let Some((response, model)) = ctx.solve_with_assumption([x, y, ctx.not(z)])? {
+            assert_eq!(response, Response::Unsat);
+            match ctx.get(model) {
+                SExprData::List(elements) => {
+                    assert!(
+                        elements.is_empty(),
+                        "Model should be empty for UNSAT result"
+                    );
+                }
+                _ => panic!("Expected model to be a list"),
+            }
+        }
+
+        // x, y, z が全て真の場合（充足可能なはず）
+        if let Some((response, model)) = ctx.solve_with_assumption([x, y, z])? {
+            assert_eq!(response, Response::Sat);
+            match ctx.get(model) {
+                SExprData::List(elements) => {
+                    assert!(
+                        !elements.is_empty(),
+                        "Model should not be empty for SAT result"
+                    );
+                    // モデルの中身を検証
+                    let model_str = ctx.display(model).to_string();
+                    assert!(
+                        model_str.contains("x"),
+                        "Model should contain assignment for x"
+                    );
+                    assert!(
+                        model_str.contains("y"),
+                        "Model should contain assignment for y"
+                    );
+                    assert!(
+                        model_str.contains("z"),
+                        "Model should contain assignment for z"
+                    );
+                }
+                _ => panic!("Expected model to be a list"),
+            }
+        }
+
+        Ok(())
     }
 }
